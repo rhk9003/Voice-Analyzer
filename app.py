@@ -3,35 +3,45 @@ import io
 import re
 import json
 import datetime as dt
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 import streamlit as st
 
+# Gemini
 try:
     import google.generativeai as genai
 except Exception:
     genai = None
 
-# Optional extractors
+# PDF
 try:
     from pypdf import PdfReader
 except Exception:
     PdfReader = None
 
+# DOCX
 try:
     import docx  # python-docx
 except Exception:
     docx = None
 
+# HTML
 try:
     from bs4 import BeautifulSoup
 except Exception:
     BeautifulSoup = None
 
+# Images
 try:
     from PIL import Image
 except Exception:
     Image = None
+
+# Tables
+try:
+    import pandas as pd
+except Exception:
+    pd = None
 
 
 APP_TITLE = "Voice Analyzer | Persona & Voice Spec (Gemini)"
@@ -47,13 +57,24 @@ def now_str() -> str:
 
 def clamp_text(text: str, max_chars: int) -> str:
     text = (text or "").strip()
+    if max_chars <= 0:
+        return ""
     if len(text) > max_chars:
         return text[:max_chars] + "\n\n[TRUNCATED]"
     return text
 
 
-def read_plain_text(uploaded_file, max_chars: int) -> str:
-    raw = uploaded_file.read()
+def bytes_of(uploaded_file) -> bytes:
+    """Streamlit UploadedFile safe bytes getter (no cursor issues)."""
+    try:
+        return uploaded_file.getvalue()
+    except Exception:
+        # fallback
+        uploaded_file.seek(0)
+        return uploaded_file.read()
+
+
+def extract_text_from_plain_bytes(raw: bytes, max_chars: int) -> str:
     try:
         txt = raw.decode("utf-8", errors="ignore")
     except Exception:
@@ -61,10 +82,9 @@ def read_plain_text(uploaded_file, max_chars: int) -> str:
     return clamp_text(txt, max_chars)
 
 
-def extract_text_from_pdf(uploaded_file, max_chars: int) -> str:
+def extract_text_from_pdf_bytes(raw: bytes, max_chars: int) -> str:
     if PdfReader is None:
         return ""
-    raw = uploaded_file.read()
     try:
         reader = PdfReader(io.BytesIO(raw))
         chunks = []
@@ -77,10 +97,9 @@ def extract_text_from_pdf(uploaded_file, max_chars: int) -> str:
         return ""
 
 
-def extract_text_from_docx(uploaded_file, max_chars: int) -> str:
+def extract_text_from_docx_bytes(raw: bytes, max_chars: int) -> str:
     if docx is None:
         return ""
-    raw = uploaded_file.read()
     try:
         d = docx.Document(io.BytesIO(raw))
         paras = [p.text for p in d.paragraphs if p.text and p.text.strip()]
@@ -89,17 +108,18 @@ def extract_text_from_docx(uploaded_file, max_chars: int) -> str:
         return ""
 
 
-def extract_text_from_html(uploaded_file, max_chars: int) -> str:
-    raw = uploaded_file.read()
+def extract_text_from_html_bytes(raw: bytes, max_chars: int) -> str:
     try:
         html = raw.decode("utf-8", errors="ignore")
     except Exception:
         return ""
+
     if BeautifulSoup is None:
-        # fallback: strip tags roughly
+        # best-effort strip tags
         text = re.sub(r"<[^>]+>", " ", html)
         text = re.sub(r"\s+", " ", text)
         return clamp_text(text, max_chars)
+
     try:
         soup = BeautifulSoup(html, "html.parser")
         text = soup.get_text(separator="\n")
@@ -109,31 +129,100 @@ def extract_text_from_html(uploaded_file, max_chars: int) -> str:
         return ""
 
 
-def extract_text_from_rtf(uploaded_file, max_chars: int) -> str:
+def extract_text_from_rtf_bytes(raw: bytes, max_chars: int) -> str:
     # Minimal RTF stripper (best-effort)
-    raw = uploaded_file.read()
     try:
         rtf = raw.decode("utf-8", errors="ignore")
     except Exception:
         return ""
-    # remove rtf control words and braces
     text = re.sub(r"{\\.*?}|\\[a-zA-Z]+\d* ?", " ", rtf)
     text = re.sub(r"[{}]", " ", text)
     text = re.sub(r"\s+", " ", text)
     return clamp_text(text, max_chars)
 
 
-def load_image(uploaded_file):
+def load_image_from_bytes(raw: bytes):
     if Image is None:
         return None
-    raw = uploaded_file.read()
     try:
         return Image.open(io.BytesIO(raw)).convert("RGB")
     except Exception:
         return None
 
 
-def build_prompt(sample_blocks: List[str], notes: str, constraints: str, output_language: str, attachments_report: str) -> str:
+def summarize_dataframe_voice(df, sheet_name: str, max_rows_per_col: int, max_cell_chars: int) -> str:
+    """Turn a table into a 'voice evidence' summary text."""
+    if df is None or df.empty:
+        return ""
+
+    blocks = [f"=== [TABLE SHEET: {sheet_name}] ==="]
+    for col in df.columns:
+        try:
+            series = df[col].dropna().astype(str).str.strip()
+        except Exception:
+            continue
+
+        # filter blanks after strip
+        series = series[series != ""]
+        if series.empty:
+            continue
+
+        samples = series.head(max_rows_per_col).tolist()
+        if not samples:
+            continue
+
+        blocks.append(f"【欄位：{str(col)}】")
+        for s in samples:
+            s = s[:max_cell_chars]
+            blocks.append(f"- {s}")
+
+    blocks.append(f"=== [/TABLE SHEET: {sheet_name}] ===")
+    return "\n".join(blocks)
+
+
+def extract_text_from_table_bytes(raw: bytes, filename: str, max_chars: int, max_rows_per_col: int = 8) -> str:
+    """
+    CSV / Excel -> voice evidence text
+    - Excel: summarize up to first few sheets (to avoid huge prompts)
+    """
+    if pd is None:
+        return ""
+
+    name = filename.lower()
+    bio = io.BytesIO(raw)
+
+    try:
+        if name.endswith(".csv"):
+            # CSV: let pandas infer encoding best-effort
+            df = pd.read_csv(bio)
+            text = summarize_dataframe_voice(df, "CSV", max_rows_per_col=max_rows_per_col, max_cell_chars=160)
+            return clamp_text(text, max_chars)
+
+        # Excel: read multiple sheets
+        sheets: Dict[str, Any] = pd.read_excel(bio, sheet_name=None)
+        blocks = [f"=== [EXCEL FILE: {filename}] ==="]
+
+        # limit sheets to avoid explosion
+        for i, (sname, df) in enumerate(sheets.items()):
+            if i >= 5:
+                blocks.append("...（其餘工作表略過）")
+                break
+            blocks.append(summarize_dataframe_voice(df, sname, max_rows_per_col=max_rows_per_col, max_cell_chars=160))
+
+        blocks.append(f"=== [/EXCEL FILE: {filename}] ===")
+        return clamp_text("\n\n".join([b for b in blocks if b.strip()]), max_chars)
+
+    except Exception:
+        return ""
+
+
+def build_prompt(
+    sample_blocks: List[str],
+    notes: str,
+    constraints: str,
+    output_language: str,
+    attachments_report: str,
+) -> str:
     samples_joined = "\n\n".join([b for b in sample_blocks if b.strip()]).strip()
     notes = (notes or "").strip()
     constraints = (constraints or "").strip()
@@ -149,11 +238,12 @@ def build_prompt(sample_blocks: List[str], notes: str, constraints: str, output_
 
 【重要規則】
 1) 「可抽取文本的檔案」= 證據層：你只能從這裡歸納語感特徵、句法、立場、節奏，不可憑空捏造作者背景。
-2) 「圖片檔」= 證據層：你可以根據圖片中可見文字/版面/語氣用法做歸納（不要臆測看不見的內容）。
-3) 「我的筆記」= 語境校準層：可以補足作者定位/價值觀脈絡；若與證據層衝突，必須指出衝突並給出兩套版本（V-A: 以證據為準；V-B: 以筆記為準）。
-4) 禁止引用任何樣本文本原句超過 25 字；不得大量抄錄。
-5) 你的輸出必須可執行：要能讓另一個 AI 按規格穩定模仿寫作。
-6) {lang_rule}
+2) 「Excel/CSV」= 證據層：我已將表格轉成「欄位＋樣例」的語感摘要，你可用來判斷命名風格、句型習慣、語彙偏好。
+3) 「圖片檔」= 證據層：你可以根據圖片中可見文字/版面/語氣用法做歸納（不要臆測看不見的內容）。
+4) 「我的筆記」= 語境校準層：可以補足作者定位/價值觀脈絡；若與證據層衝突，必須指出衝突並給出兩套版本（V-A: 以證據為準；V-B: 以筆記為準）。
+5) 禁止引用任何樣本文本原句超過 25 字；不得大量抄錄。
+6) 你的輸出必須可執行：要能讓另一個 AI 按規格穩定模仿寫作。
+7) {lang_rule}
 
 【你收到的附件狀態（供你判斷證據強度）】
 {attachments_report}
@@ -200,7 +290,13 @@ D) 快速驗收清單（讓總編輯快速檢查是否像他）
 """.strip()
 
 
-def call_gemini_multimodal(api_key: str, prompt_text: str, images: List, temperature: float, max_output_tokens: int) -> str:
+def call_gemini_multimodal(
+    api_key: str,
+    prompt_text: str,
+    images: List,
+    temperature: float,
+    max_output_tokens: int,
+) -> str:
     if genai is None:
         raise RuntimeError("google-generativeai 未安裝或匯入失敗。請確認 requirements.txt。")
 
@@ -208,7 +304,6 @@ def call_gemini_multimodal(api_key: str, prompt_text: str, images: List, tempera
     model = genai.GenerativeModel(MODEL_NAME)
 
     parts = [prompt_text]
-    # Attach images as additional parts (multimodal)
     for img in images:
         if img is not None:
             parts.append(img)
@@ -225,6 +320,7 @@ def call_gemini_multimodal(api_key: str, prompt_text: str, images: List, tempera
     if text:
         return text
 
+    # fallback for SDK variations
     try:
         return resp.candidates[0].content.parts[0].text
     except Exception:
@@ -235,8 +331,8 @@ def call_gemini_multimodal(api_key: str, prompt_text: str, images: List, tempera
 # UI
 # -----------------------------
 st.set_page_config(page_title=APP_TITLE, page_icon="🧬", layout="wide")
-st.title("🧬 Voice Analyzer（多格式 + 圖檔支援）")
-st.caption(f"固定模型：{MODEL_NAME}｜輸入：多種檔案格式 + 你的筆記｜輸出：Persona Brief + Voice Spec + VOICE CONTEXT（可貼入封包）")
+st.title("🧬 Voice Analyzer（多格式 + Excel/CSV + 圖檔）")
+st.caption(f"固定模型：{MODEL_NAME}｜輸入：文件/表格/截圖 + 你的筆記｜輸出：Persona Brief + Voice Spec + VOICE CONTEXT（可貼入封包）")
 
 with st.sidebar:
     st.subheader("🔑 Gemini API Key")
@@ -250,7 +346,8 @@ with st.sidebar:
     st.divider()
     st.subheader("🧠 證據限制（避免 prompt 爆炸）")
     max_chars_per_file = st.slider("每個可抽文本檔的最大字元數", 5000, 200000, 60000, 5000)
-    max_total_chars = st.slider("全部文本合計最大字元數", 20000, 400000, 180000, 10000)
+    max_total_chars = st.slider("全部文本合計最大字元數", 20000, 500000, 200000, 10000)
+    max_rows_per_col = st.slider("Excel/CSV 每欄最多取樣筆數", 3, 20, 8, 1)
 
     st.divider()
     output_language = st.selectbox("輸出語言", ["繁體中文", "English", "日本語"], index=0)
@@ -263,11 +360,14 @@ col1, col2 = st.columns([1, 1], gap="large")
 
 with col1:
     st.subheader("1) 上傳樣本（支援多格式）")
-    st.write("支援：txt / md / pdf / docx / html / rtf / csv + png/jpg/jpeg/webp（圖檔會走多模態，不靠 OCR）")
+    st.write(
+        "支援：txt / md / pdf / docx / html / rtf / csv / xlsx / xls "
+        "+ png/jpg/jpeg/webp（圖檔走多模態；Excel/CSV 會轉成欄位＋樣例的語感摘要）"
+    )
 
     uploads = st.file_uploader(
         "上傳檔案（可多檔）",
-        type=["txt", "md", "pdf", "docx", "html", "htm", "rtf", "csv", "png", "jpg", "jpeg", "webp"],
+        type=["txt", "md", "pdf", "docx", "html", "htm", "rtf", "csv", "xlsx", "xls", "png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True
     )
 
@@ -296,8 +396,8 @@ with col2:
     run = st.button("🚀 開始語感分析", type="primary", use_container_width=True)
 
     st.info(
-        "策略：能抽字就抽字；圖檔直接附給模型。\n"
-        "若某些檔案抽不到字（掃描PDF/特殊格式），會在『附件狀態』標記，並以你的筆記補足語境。"
+        "策略：能抽字就抽字；Excel/CSV 轉成『欄位＋樣例』摘要；圖檔直接附給模型。\n"
+        "若掃描 PDF 抽不到字，建議改傳可選取文字的 PDF，或直接上傳截圖/圖片。"
     )
 
 
@@ -311,54 +411,73 @@ total_chars = 0
 
 if uploads:
     for f in uploads:
-        name = f.name
-        ext = name.lower().split(".")[-1] if "." in name else ""
+        filename = f.name
+        ext = filename.lower().split(".")[-1] if "." in filename else ""
         mime = getattr(f, "type", "")
 
-        # Image files
+        raw = bytes_of(f)
+
+        # Image files -> multimodal
         if ext in ("png", "jpg", "jpeg", "webp"):
-            img = load_image(f)
+            img = load_image_from_bytes(raw)
             if img is not None:
                 images.append(img)
-                report_lines.append(f"- ✅ 圖檔：{name}（多模態已附加）")
+                report_lines.append(f"- ✅ 圖檔：{filename}（多模態已附加）")
             else:
-                report_lines.append(f"- ⚠️ 圖檔：{name}（讀取失敗，請換格式或重傳）")
+                report_lines.append(f"- ⚠️ 圖檔：{filename}（讀取失敗，請換格式或重傳）")
             continue
 
-        # Text-extractable formats
+        # Text extractable
         extracted = ""
-        if ext in ("txt", "md", "csv"):
-            extracted = read_plain_text(f, max_chars=max_chars_per_file)
+
+        if ext in ("csv", "xlsx", "xls"):
+            extracted = extract_text_from_table_bytes(
+                raw=raw,
+                filename=filename,
+                max_chars=max_chars_per_file,
+                max_rows_per_col=max_rows_per_col
+            )
+
+        elif ext in ("txt", "md"):
+            extracted = extract_text_from_plain_bytes(raw, max_chars=max_chars_per_file)
+
         elif ext in ("pdf",):
-            extracted = extract_text_from_pdf(f, max_chars=max_chars_per_file)
+            extracted = extract_text_from_pdf_bytes(raw, max_chars=max_chars_per_file)
+
         elif ext in ("docx",):
-            extracted = extract_text_from_docx(f, max_chars=max_chars_per_file)
+            extracted = extract_text_from_docx_bytes(raw, max_chars=max_chars_per_file)
+
         elif ext in ("html", "htm"):
-            extracted = extract_text_from_html(f, max_chars=max_chars_per_file)
+            extracted = extract_text_from_html_bytes(raw, max_chars=max_chars_per_file)
+
         elif ext in ("rtf",):
-            extracted = extract_text_from_rtf(f, max_chars=max_chars_per_file)
+            extracted = extract_text_from_rtf_bytes(raw, max_chars=max_chars_per_file)
+
         else:
-            # fallback: try reading as text
-            extracted = read_plain_text(f, max_chars=max_chars_per_file)
+            # fallback: try read as text
+            extracted = extract_text_from_plain_bytes(raw, max_chars=max_chars_per_file)
 
         extracted = (extracted or "").strip()
         if extracted:
             remaining = max_total_chars - total_chars
             if remaining <= 0:
-                report_lines.append(f"- ⏭️ {name}（可抽字但已達總字元上限，略過）")
+                report_lines.append(f"- ⏭️ {filename}（可抽字但已達總字元上限，略過）")
                 continue
 
             if len(extracted) > remaining:
                 extracted = extracted[:remaining] + "\n\n[TRUNCATED_BY_TOTAL_LIMIT]"
 
             total_chars += len(extracted)
-            sample_blocks.append(f"=== [FILE: {name} | {mime}] ===\n{extracted}\n=== [/FILE] ===")
-            report_lines.append(f"- ✅ 可抽字：{name}（納入 {len(extracted):,} 字）")
+            sample_blocks.append(f"=== [FILE: {filename} | {mime}] ===\n{extracted}\n=== [/FILE] ===")
+            report_lines.append(f"- ✅ 可抽字：{filename}（納入 {len(extracted):,} 字）")
         else:
-            report_lines.append(f"- ⚠️ {name}（抽不到文字；可能是掃描/特殊格式。請改傳可選取文字的版本，或貼關鍵段落）")
+            report_lines.append(
+                f"- ⚠️ {filename}（抽不到文字/摘要；可能是掃描PDF或格式不支援。建議貼關鍵段落或改傳可選取文字版本）"
+            )
 
 if pasted.strip():
-    paste_txt = clamp_text(pasted.strip(), max_total_chars - total_chars if max_total_chars - total_chars > 0 else 0)
+    remaining = max_total_chars - total_chars
+    paste_txt = clamp_text(pasted.strip(), remaining)
     if paste_txt:
         sample_blocks.append(f"=== [PASTED] ===\n{paste_txt}\n=== [/PASTED] ===")
         report_lines.append(f"- ✅ 直接貼上文本（納入 {len(paste_txt):,} 字）")
@@ -462,7 +581,9 @@ st.divider()
 st.subheader("📚 Session History（本次瀏覽器期間）")
 if st.session_state.history:
     for i, item in enumerate(st.session_state.history[:10], start=1):
-        with st.expander(f"{i}. {item['ts']} | {item['model']} | temp={item['temperature']} | img={item['images_count']}"):
+        with st.expander(
+            f"{i}. {item['ts']} | {item['model']} | temp={item['temperature']} | img={item['images_count']} | chars={item['total_text_chars']:,}"
+        ):
             st.write(item["output"])
 else:
     st.caption("尚無紀錄。")
